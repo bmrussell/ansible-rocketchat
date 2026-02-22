@@ -1,4 +1,14 @@
 ---
+
+# PREREQUISITES
+# This playbook assumes the following prerequisites are met:
+# Ansible on Ubuntu:
+# sudo apt install -y software-properties-common
+# sudo add-apt-repository --yes --update ppa:ansible/ansible
+# sudo apt update
+# sudo apt install -y ansible
+# . ansible-galaxy collection install community.docker
+
 - name: Rocketchat Server Configuration
   hosts: localhost
   connection: local
@@ -30,6 +40,8 @@
           - apt-listchanges
           - openssh-server
           - iptables-persistent
+          - python3-pip
+          - software-properties-common
         state: present
       become: yes
     
@@ -77,57 +89,6 @@
       become: yes
       when: not ansible_check_mode
     
-    - name: Copy rocketchat environment template file
-      copy:
-        src: rocketchat-compose/.env.example
-        dest: rocketchat-compose/.env
-
-    - name: Configure Rocketchat .env - set DOMAIN
-      lineinfile:
-        path: rocketchat-compose/.env
-        regexp: '^DOMAIN='
-        line: 'DOMAIN={{ dyndns_hostname }}'
-    
-    - name: Configure Rocketchat .env - set ROOT_URL
-      lineinfile:
-        path: rocketchat-compose/.env
-        regexp: '^ROOT_URL='
-        line: 'ROOT_URL={{ dyndns_hostname }}'
-    
-    - name: Configure Rocketchat .env - set GRAFANA_ADMIN_PASSWORD
-      lineinfile:
-        path: rocketchat-compose/.env
-        regexp: '^GRAFANA_ADMIN_PASSWORD='
-        line: 'GRAFANA_ADMIN_PASSWORD={{ grafana_password }}'
-    
-    - name: Build Rocketchat Docker Compose containers
-      shell: |
-        cd rocketchat-compose
-        docker compose -f compose.yml -f compose.database.yml -f compose.monitoring.yml -f compose.traefik.yml up -d
-      become: yes
-      when: not ansible_check_mode
-    
-    - name: Copy iptables rules file
-      copy:
-        src: iptables-rules.v4
-        dest: /etc/iptables/rules.v4
-        owner: root
-        group: root
-        mode: '0600'
-      become: yes
-    
-    - name: Apply iptables rules
-      shell: iptables-restore < /etc/iptables/rules.v4
-      become: yes
-      check_mode: no
-    
-    - name: Enable netfilter-persistent service for iptables persistence on boot
-      systemd:
-        name: netfilter-persistent
-        enabled: yes
-        state: started
-      become: yes
-      when: not ansible_check_mode
     
     - name: Configure fail2ban for SSH
       copy:
@@ -340,7 +301,86 @@
         state: started
       become: yes
       when: not ansible_check_mode
-  
+# UPDATES
+    - name: Clone RocketChat Compose repository
+      ansible.builtin.git:
+        repo: https://github.com/RocketChat/rocketchat-compose.git
+        dest: rocketchat-compose
+        depth: 1
+    
+    - name: Copy .env.example to .env
+      ansible.builtin.copy:
+        src: rocketchat-compose/.env.example
+        dest: rocketchat-compose/.env
+        remote_src: yes
+      check_mode: no
+    
+    - name: Update DOMAIN in .env
+      ansible.builtin.lineinfile:
+        path: rocketchat-compose/.env
+        regexp: '^DOMAIN='
+        line: 'DOMAIN={{ dyndns_hostname }}'
+    
+    - name: Update ROOT_URL in .env
+      ansible.builtin.lineinfile:
+        path: rocketchat-compose/.env
+        regexp: '^ROOT_URL='
+        line: 'ROOT_URL=http://{{ dyndns_hostname }}'
+    
+    - name: Update GRAFANA_ADMIN_PASSWORD in .env
+      ansible.builtin.lineinfile:
+        path: rocketchat-compose/.env
+        regexp: '^GRAFANA_ADMIN_PASSWORD='
+        line: 'GRAFANA_ADMIN_PASSWORD={{ grafana_password }}'
+    
+
+    
+    - name: Install Docker Python SDK
+      ansible.builtin.pip:
+        name: docker
+        state: present
+      become: yes
+      check_mode: no
+    
+    - name: Install docker-compose Python library
+      ansible.builtin.pip:
+        name: docker-compose
+        state: present
+      become: yes
+      check_mode: no
+    
+    - name: Start Docker Compose database services
+      community.docker.docker_compose_v2:
+        project_src: rocketchat-compose
+        files:
+          - compose.database.yml
+        state: present
+      become: yes
+    
+    - name: Start Docker Compose monitoring services
+      community.docker.docker_compose_v2:
+        project_src: rocketchat-compose
+        files:
+          - compose.monitoring.yml
+        state: present
+      become: yes
+    
+    - name: Start Docker Compose Traefik services
+      community.docker.docker_compose_v2:
+        project_src: rocketchat-compose
+        files:
+          - compose.traefik.yml
+        state: present
+      become: yes
+    
+    - name: Start Docker Compose main services
+      community.docker.docker_compose_v2:
+        project_src: rocketchat-compose
+        files:
+          - compose.yml
+        state: present
+      become: yes
+
   handlers:
     - name: restart fail2ban
       systemd:

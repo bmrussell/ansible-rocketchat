@@ -1,0 +1,4 @@
+.vault-password
+vault/
+*.vault-backup
+.env
