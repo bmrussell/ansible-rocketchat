@@ -1,0 +1,358 @@
+---
+- name: Rocketchat Server Configuration
+  hosts: localhost
+  connection: local
+  gather_facts: yes
+  
+  vars_files:
+    - vault/secrets.yml
+  
+  tasks:
+    - name: Update system packages
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      become: yes
+    
+    - name: Install essential packages
+      apt:
+        name:
+          - curl
+          - wget
+          - git
+          - htop
+          - vim
+          - neovim
+          - bzip2
+          - tar
+          - fail2ban
+          - unattended-upgrades
+          - apt-listchanges
+          - openssh-server
+          - iptables-persistent
+        state: present
+      become: yes
+    
+    - name: Add Docker GPG key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+      become: yes
+    
+    - name: Add Docker repository
+      apt_repository:
+        repo: deb https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable
+        state: present
+      become: yes
+    
+    - name: Install Docker
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-compose-plugin
+        state: present
+        update_cache: yes
+      become: yes
+    
+    - name: Create docker group
+      group:
+        name: docker
+        state: present
+      become: yes
+    
+    - name: Add user to docker group
+      user:
+        name: "{{ ansible_user_id }}"
+        groups: docker
+        append: yes
+      become: yes
+    
+    - name: Enable and start Docker service
+      systemd:
+        name: docker
+        enabled: yes
+        state: started
+      become: yes
+      when: not ansible_check_mode
+    
+    - name: Copy rocketchat environment template file
+      copy:
+        src: rocketchat-compose/.env.example
+        dest: rocketchat-compose/.env
+
+    - name: Configure Rocketchat .env - set DOMAIN
+      lineinfile:
+        path: rocketchat-compose/.env
+        regexp: '^DOMAIN='
+        line: 'DOMAIN={{ dyndns_hostname }}'
+    
+    - name: Configure Rocketchat .env - set ROOT_URL
+      lineinfile:
+        path: rocketchat-compose/.env
+        regexp: '^ROOT_URL='
+        line: 'ROOT_URL={{ dyndns_hostname }}'
+    
+    - name: Configure Rocketchat .env - set GRAFANA_ADMIN_PASSWORD
+      lineinfile:
+        path: rocketchat-compose/.env
+        regexp: '^GRAFANA_ADMIN_PASSWORD='
+        line: 'GRAFANA_ADMIN_PASSWORD={{ grafana_password }}'
+    
+    - name: Build Rocketchat Docker Compose containers
+      shell: |
+        cd rocketchat-compose
+        docker compose -f compose.yml -f compose.database.yml -f compose.monitoring.yml -f compose.traefik.yml up -d
+      become: yes
+      when: not ansible_check_mode
+    
+    - name: Copy iptables rules file
+      copy:
+        src: iptables-rules.v4
+        dest: /etc/iptables/rules.v4
+        owner: root
+        group: root
+        mode: '0600'
+      become: yes
+    
+    - name: Apply iptables rules
+      shell: iptables-restore < /etc/iptables/rules.v4
+      become: yes
+      check_mode: no
+    
+    - name: Enable netfilter-persistent service for iptables persistence on boot
+      systemd:
+        name: netfilter-persistent
+        enabled: yes
+        state: started
+      become: yes
+      when: not ansible_check_mode
+    
+    - name: Configure fail2ban for SSH
+      copy:
+        content: |
+          [DEFAULT]
+          bantime = 3600
+          findtime = 600
+          maxretry = 5
+          
+          [ssh]
+          enabled = true
+          port = ssh
+          filter = ssh
+          logpath = %(ssh_log)s
+        dest: /etc/fail2ban/jail.local
+        owner: root
+        group: root
+        mode: '0644'
+      become: yes
+      notify: restart fail2ban
+    
+    - name: Enable and start fail2ban
+      systemd:
+        name: fail2ban
+        enabled: yes
+        state: started
+      become: yes
+      when: not ansible_check_mode
+    
+    - name: Ensure SSH service is started to generate config
+      systemd:
+        name: ssh
+        enabled: yes
+        state: started
+      become: yes
+      when: not ansible_check_mode
+    
+    - name: Ensure ssh_config file exists
+      copy:
+        content: ""
+        dest: /etc/ssh/ssh_config
+        owner: root
+        group: root
+        mode: '0600'
+        force: no
+      become: yes
+      check_mode: no
+    
+    - name: Configure SSH hardening - disable root login
+      lineinfile:
+        path: /etc/ssh/ssh_config
+        regexp: '^#?PermitRootLogin'
+        line: 'PermitRootLogin no'
+      become: yes
+      notify: restart ssh
+    
+    - name: Configure SSH hardening - disable password authentication
+      lineinfile:
+        path: /etc/ssh/ssh_config
+        regexp: '^#?PasswordAuthentication'
+        line: 'PasswordAuthentication no'
+      become: yes
+      notify: restart ssh
+    
+    - name: Configure SSH hardening - disable empty passwords
+      lineinfile:
+        path: /etc/ssh/ssh_config
+        regexp: '^#?PermitEmptyPasswords'
+        line: 'PermitEmptyPasswords no'
+      become: yes
+      notify: restart ssh
+    
+    - name: Configure SSH hardening - disable password-based sudo
+      lineinfile:
+        path: /etc/ssh/ssh_config
+        regexp: '^#?ChallengeResponseAuthentication'
+        line: 'ChallengeResponseAuthentication no'
+      become: yes
+      notify: restart ssh
+    
+    - name: Configure SSH hardening - allow only key-based authentication protocols
+      lineinfile:
+        path: /etc/ssh/ssh_config
+        regexp: '^#?AuthenticationMethods'
+        line: 'AuthenticationMethods publickey'
+      become: yes
+      notify: restart ssh
+    
+    - name: Configure SSH hardening - set max authentication attempts
+      lineinfile:
+        path: /etc/ssh/ssh_config
+        regexp: '^#?MaxAuthTries'
+        line: 'MaxAuthTries 3'
+      become: yes
+      notify: restart ssh
+    
+    - name: Configure unattended upgrades - enable auto security updates
+      copy:
+        content: |
+          APT::Periodic::Update-Package-Lists "1";
+          APT::Periodic::Download-Upgradeable-Packages "1";
+          APT::Periodic::AutocleanInterval "7";
+          APT::Periodic::Unattended-Upgrade "1";
+          APT::Periodic::Reboot "0";
+          APT::Periodic::Mail "root";
+          
+          Unattended-Upgrade::Package-Blacklist {
+          };
+          Unattended-Upgrade::AutoFixInterruptedDpkg "true";
+          Unattended-Upgrade::MinimalSteps "true";
+          Unattended-Upgrade::RemoveUnusedKernelPackages "true";
+          Unattended-Upgrade::RemoveNewUnnecessaryDependencies "true";
+          Unattended-Upgrade::Remove-Unused-Boot-Grub-Kernel-Packages "true";
+        dest: /etc/apt/apt.conf.d/50unattended-upgrades
+        owner: root
+        group: root
+        mode: '0644'
+      become: yes
+        
+    - name: Download DynDNS client (NoIP DUC)
+      shell: |
+        cd /tmp
+        wget --content-disposition https://www.noip.com/download/linux/latest
+      args:
+        creates: /tmp/noip-duc_*.tar.gz
+      become: yes
+    
+    - name: Create /tmp/noip directory
+      file:
+        path: /tmp/noip
+        state: directory
+        mode: '0755'
+      become: yes
+    
+    - name: Extract DynDNS client archive
+      shell: |
+        cd /tmp
+        tar -xf noip-duc_*.tar.gz -C /tmp/noip --strip-components=1
+      args:
+        creates: /tmp/noip/binaries
+      become: yes
+    
+    - name: Install noip-duc package
+      shell: |
+        cd /tmp/noip/binaries
+        apt install -y ./noip-duc_*_amd64.deb
+      args:
+        creates: /usr/bin/noip-duc
+      become: yes
+    
+    - name: Create noip system user
+      user:
+        name: noip
+        system: yes
+        shell: /usr/sbin/nologin
+        state: present
+      become: yes
+    
+    - name: Create /etc/noip-duc directory
+      file:
+        path: /etc/noip-duc
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      become: yes
+    
+    - name: Create noip-duc environment file
+      copy:
+        content: |
+          USERNAME={{ dyndns_username }}
+          PASSWORD={{ dyndns_password }}
+        dest: /etc/noip-duc/env
+        owner: noip
+        group: noip
+        mode: '0600'
+      become: yes
+    
+    - name: Create noip-duc systemd service file
+      copy:
+        content: |
+          [Unit]
+          Description=No-IP Dynamic Update Client
+          After=network.target
+          
+          [Service]
+          Type=simple
+          User=noip
+          EnvironmentFile=/etc/noip-duc/env
+          ExecStart=/usr/bin/noip-duc -g {{ dyndns_hostname }} --username $USERNAME --password $PASSWORD
+          Restart=on-failure
+          
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/noip-duc.service
+        owner: root
+        group: root
+        mode: '0644'
+      become: yes
+    
+    - name: Reload systemd daemon for noip-duc service
+      systemd:
+        daemon_reload: yes
+      become: yes
+    
+    - name: Enable and start noip-duc service
+      systemd:
+        name: noip-duc
+        enabled: yes
+        state: started
+      become: yes
+      when: not ansible_check_mode
+  
+  handlers:
+    - name: restart fail2ban
+      systemd:
+        name: fail2ban
+        state: restarted
+      become: yes
+      when: not ansible_check_mode
+    
+    - name: restart ssh
+      systemd:
+        name: ssh
+        state: restarted
+      become: yes
+      when: not ansible_check_mode
+
